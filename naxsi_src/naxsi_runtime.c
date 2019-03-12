@@ -29,6 +29,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include "naxsi.h"
+#include <mysql.h>
+#include <hiredis/hiredis.h>
 static int content_type_filter = 0;
 /* used to store locations during the configuration time. 
    then, accessed by the hashtable building feature during "init" time. */
@@ -107,14 +109,6 @@ ngx_http_rule_t nx_int__empty_post_body = {/*type*/ 0, /*whitelist flag*/ 0,
 
 ngx_http_rule_t *nx_int__libinject_sql; /*ID:17*/
 ngx_http_rule_t *nx_int__libinject_xss; /*ID:18*/
-
-ngx_http_rule_t nx_int__no_rules = {/*type*/ 0, /*whitelist flag*/ 0, 
-				    /*wl_id ptr*/ NULL, /*rule_id*/ 19,
-				    /*log_msg*/ NULL, /*score*/ 0, 
-				    /*sscores*/ NULL,
-				    /*sc_block*/ 0,  /*sc_allow*/ 0, 
-				    /*block*/ 0,  /*allow*/ 0, /*drop*/ 1, /*log*/ 0,
-				    /*br ptrs*/ NULL};
 
 
 
@@ -804,7 +798,9 @@ ngx_int_t ngx_http_nx_log(ngx_http_request_ctx_t *ctx,
   ngx_http_dummy_loc_conf_t	*cf;
   ngx_http_matched_rule_t	*mr;
   char		 tmp_zone[30];
-  
+  char sql[4096], lock_host[2048];
+  MYSQL_RES *res_ptr;
+
   cf = ngx_http_get_module_loc_conf(r, ngx_http_naxsi_module);
   
   tmp_uri = ngx_pcalloc(r->pool, sizeof(ngx_str_t));
@@ -831,16 +827,24 @@ ngx_int_t ngx_http_nx_log(ngx_http_request_ctx_t *ctx,
   sub = offset = 0;
   /* we keep extra space for seed*/
   sz_left = MAX_LINE_SIZE - MAX_SEED_LEN - 1;
-  
+
+
   /* 
   ** don't handle uri > 4k, string will be split
   */
+
+
   sub = snprintf((char *)fragment->data, sz_left, fmt_base, r->connection->addr_text.len,
 		 r->connection->addr_text.data,
 		 r->headers_in.server.len, r->headers_in.server.data,
 		 tmp_uri->len, tmp_uri->data, ctx->learning ? 1 : 0, strlen(NAXSI_VERSION),
 		 NAXSI_VERSION, cf->request_processed, cf->request_blocked, ctx->block ? 1 : (ctx->drop ? 1 : 0));
-  
+
+	char Host[256];
+	const char *fmt_base2 = "%.*s";
+	snprintf((char *) Host, sizeof(Host), fmt_base2,
+			r->connection->addr_text.len, r->connection->addr_text.data);
+
   if (sub >= sz_left)
     sub = sz_left - 1;
   sz_left -= sub;
@@ -875,8 +879,53 @@ ngx_int_t ngx_http_nx_log(ngx_http_request_ctx_t *ctx,
 	sub = sz_left - 1;
       offset += sub;
       sz_left -= sub;
+
+			snprintf(sql, sizeof(sql),
+					"insert into naxsi_attack_log values (NULL, '%s','%s', '%s', '%zu', '%s', NOW(), 10)",
+					(char *)Host, r->headers_in.server.data, sc[i].sc_tag->data,
+					sc[i].sc_score, r->request_start);
+			snprintf(lock_host, sizeof(lock_host),
+					"SELECT * from naxsi_attack_log where ip='%s' and at > NOW()-INTERVAL 5 MINUTE having count(*) >60",
+					(char *) Host);
+
+			if (conn_ptr) {
+				mysql_query(conn_ptr, sql);
+				mysql_query(conn_ptr, lock_host);
+				res_ptr = mysql_store_result(conn_ptr);
+				if (res_ptr) {
+					redisContext *c;
+					redisReply *reply;
+					struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+					c = redisConnectWithTimeout("127.0.0.1", 6379, timeout);
+					if (c == NULL || c->err) {
+						redisFree(c);
+					}
+
+					while (mysql_fetch_row(res_ptr) &&  !c->err) {
+						reply = redisCommand(c, "GET white%s", Host);
+						if (reply->str == NULL && !ctx->learning ) {
+						reply = redisCommand(c, "SETEX %s %s %s", Host,
+								"1800",  Host);
+                                                /* Increase the history record  */
+                                                reply = redisCommand(c,"SELECT 2");
+                                                reply = redisCommand(c, "SET %s %s", Host, Host);
+                                                reply = redisCommand(c,"SELECT 0");
+                                                /* Increase the history record */
+						}
+						freeReplyObject(reply);
+					}
+					if (!c->err) {
+						redisFree(c);
+					}
+				}
+
+				mysql_free_result(res_ptr);
+
+			}
     } 
   }
+
+
   /*
   ** and matched zone/id/name
   */
@@ -934,6 +983,9 @@ ngx_int_t ngx_http_nx_log(ngx_http_request_ctx_t *ctx,
       i += 1;
     } while(i < ctx->matched->nelts);
   }
+	if (conn_ptr) {
+		mysql_close(conn_ptr);
+	}
   fragment->len = offset;
   return (NGX_HTTP_OK);
 }
@@ -949,7 +1001,19 @@ ngx_http_output_forbidden_page(ngx_http_request_ctx_t *ctx,
   ngx_http_dummy_loc_conf_t	*cf;
   ngx_array_t	*ostr;
   ngx_table_elt_t	    *h;
-  
+  extern MYSQL *conn_ptr;
+  	conn_ptr = mysql_init(NULL);
+  	if (!conn_ptr) {
+  		return EXIT_FAILURE;
+  	}
+  	conn_ptr = mysql_real_connect(conn_ptr, "127.0.0.1", "root", "comeback",
+  			"audit_sec", 0, NULL, 0);
+  	if( conn_ptr )
+  			{
+  		mysql_query(conn_ptr, "set names utf8");
+  	} else {
+  			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "mysql connection error %s\n", mysql_error(conn_ptr));
+  	}
   cf = ngx_http_get_module_loc_conf(r, ngx_http_naxsi_module);
   /* get array of signatures strings */
   ostr = ngx_array_create(r->pool, 1, sizeof(ngx_str_t));
@@ -1040,12 +1104,11 @@ ngx_http_output_forbidden_page(ngx_http_request_ctx_t *ctx,
     return (NGX_DECLINED);
   }
   else {
-    ngx_http_internal_redirect(r, cf->denied_url,  
-			       &empty); 
-    if (content_type_filter) { 
+    ngx_http_internal_redirect(r, cf->denied_url,
+			       &empty);
+    if (content_type_filter) {
     ngx_http_finalize_request(r, NGX_HTTP_FORBIDDEN);  // struts2-045 046 defense
-	  /* MainRule "rx:%" "mz:$HEADERS_VAR:content-type" "s:DROP"; */
-    }
+   }
     return (NGX_HTTP_OK);
   }
   return (NGX_ERROR);
@@ -1443,7 +1506,7 @@ ngx_http_basestr_ruleset_n(ngx_pool_t	*pool,
       ** this one must be valid to go forward
       */
       for (z = 0; z < r[i].br->custom_locations->nelts; z++) {
-	
+        	
 	if (location[z].specific_url) {	
 	  /* if matchzone is a regex, ensure it matches (ie. BODY_VAR_X / ARGS_VAR_X / ..) */
 	  if (r[i].br->rx_mz) {
@@ -1477,7 +1540,6 @@ ngx_http_basestr_ruleset_n(ngx_pool_t	*pool,
       
       /* for each custom location */
       for (z = 0; z < r[i].br->custom_locations->nelts; z++) {
-	
 	rule_matched = 0;
 	/* check if zone is correct before checking names cf. issue #120 */
 	if ( !(zone == BODY && location[z].body_var != 0) &&
@@ -1501,16 +1563,23 @@ ngx_http_basestr_ruleset_n(ngx_pool_t	*pool,
 	
 	/* match rule against var content, */
 	ret = ngx_http_process_basic_rule_buffer(value, &(r[i]), &nb_match);
-	if (ret == 1) {
-	  NX_DEBUG(_debug_basestr_ruleset, NGX_LOG_DEBUG_HTTP, req->connection->log, 0, 
-		   "XX-apply rulematch [%V]=[%V] [rule=%d] (match %d times)", name, value, r[i].rule_id, nb_match); 
-	  if (!ngx_strncasecmp((name)->data, (u_char *)"content-type", 12) 
-	        && strstr((char *)(&(r[i].br->rx)->pattern)->data, "%") != NULL ) {
-	      content_type_filter = 1;
-	  }
-	  rule_matched = 1;
-	  ngx_http_apply_rulematch_v_n(&(r[i]), ctx, req, name, value, zone, nb_match, 0);	    
-	}
+				if (ret == 1) {
+					NX_DEBUG(_debug_basestr_ruleset, NGX_LOG_DEBUG_HTTP,
+							req->connection->log, 0,
+							"XX-apply rulematch [%V]=[%V] [rule=%d] (match %d times)",
+							name, value, r[i].rule_id, nb_match);
+//					ngx_log_debug(NGX_LOG_DEBUG_HTTP, req->connection->log, 0,
+//							"XX-apply rulematch [%s][%V]=[%V] [rule=%d] (match %d times)",
+//							(char * )(&(r[i].br->rx)->pattern)->data, name,
+//							value, r[i].rule_id, nb_match);
+					if (!ngx_strncasecmp((name)->data, (u_char *)"content-type",
+							12) && strstr((char *)(&(r[i].br->rx)->pattern)->data, "%") != NULL ) {
+						content_type_filter = 1;
+					}
+					rule_matched = 1;
+					ngx_http_apply_rulematch_v_n(&(r[i]), ctx, req, name, value,
+							zone, nb_match, 0);
+				}
 	  
 	if (!r[i].br->negative) {  
 	  /* match rule against var name, */
@@ -1558,7 +1627,6 @@ ngx_http_basestr_ruleset_n(ngx_pool_t	*pool,
 	if (ret == 1) {
 	  NX_DEBUG(_debug_basestr_ruleset, 	NGX_LOG_DEBUG_HTTP, req->connection->log, 0, 
 		   "XX-apply rulematch (value) [%V]=[%V] [rule=%d] (%d times)", name, value, r[i].rule_id, nb_match); 
-	  
 	  ngx_http_apply_rulematch_v_n(&(r[i]), ctx, req, name, value, zone, nb_match, 0);
 	}
       }
@@ -1573,7 +1641,6 @@ ngx_http_basestr_ruleset_n(ngx_pool_t	*pool,
 	if (ret == 1) {
 	  NX_DEBUG(_debug_basestr_ruleset, 	  NGX_LOG_DEBUG_HTTP, req->connection->log, 0, 
 		   "XX-apply rulematch!1 [%V]=[%V] [rule=%d] (%d times)", name, value, r[i].rule_id, nb_match); 
-
 	  ngx_http_apply_rulematch_v_n(&(r[i]), ctx, req, name, value, zone, nb_match, 1);
 	}
       }
@@ -1694,7 +1761,7 @@ nx_content_type_parse(ngx_http_request_t *r,
 {
   unsigned char *h;
   unsigned char *end;
-  
+
   h = r->headers_in.content_type->value.data + strlen("multipart/form-data;");
   end = r->headers_in.content_type->value.data + r->headers_in.content_type->value.len;
   /* skip potential whitespace/tabs */
@@ -1705,7 +1772,7 @@ nx_content_type_parse(ngx_http_request_t *r,
   h += 9;
   *boundary_len = end - h;
   *boundary = h;
-  /* RFC 1867/1341 says 70 char max, 
+  /* RFC 1867/1341 says 70 char max,
      I arbitrarily set min to 3 (yes) */
   if (*boundary_len > 70 || *boundary_len < 3)
     return (NGX_ERROR);
@@ -2077,11 +2144,6 @@ ngx_http_dummy_body_parse(ngx_http_request_ctx_t *ctx,
 			    (u_char *) "application/json", 16)) {
     ngx_http_dummy_json_parse(ctx, r, full_body, full_body_len); 
   }
-  /* 22 = echo -n "application/csp-report" | wc -c */
-  else if (!ngx_strncasecmp(r->headers_in.content_type->value.data,
-                            (u_char *) "application/csp-report", 22)) {
-    ngx_http_dummy_json_parse(ctx, r, full_body, full_body_len);
-  }
   else {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, 
 		  "[POST] Unknown content-type");
@@ -2121,9 +2183,7 @@ ngx_http_dummy_uri_parse(ngx_http_dummy_main_conf_t *main_cf,
   if ( (ctx->block && !ctx->learning) || ctx->drop )
     return ;
   if (!main_cf->generic_rules && !cf->generic_rules) {
-    tmp.data = NULL;
-    tmp.len = 0;
-    ngx_http_apply_rulematch_v_n(&nx_int__no_rules, ctx, r, &tmp, &tmp, URL, 1, 0);
+    dummy_error_fatal(ctx, r, "no generic rules ?!");
     return ;
   }
   tmp.len = r->uri.len;
@@ -2185,6 +2245,7 @@ void
 ngx_http_dummy_headers_parse(ngx_http_dummy_main_conf_t *main_cf, 
 			     ngx_http_dummy_loc_conf_t *cf, 
 			     ngx_http_request_ctx_t *ctx, ngx_http_request_t *r)
+
 {
   ngx_list_part_t	    *part;
   ngx_table_elt_t	    *h;
@@ -2201,7 +2262,7 @@ ngx_http_dummy_headers_parse(ngx_http_dummy_main_conf_t *main_cf,
   // this check may be removed, as it shouldn't be needed anymore !
   for (i = 0; ( (!ctx->block || ctx->learning) && !ctx->block) ; i++) {
     if (i >= part->nelts) {
-      if (part->next == NULL) 
+      if (part->next == NULL)
 	break;
       part = part->next;
       h = part->elts;
@@ -2216,10 +2277,10 @@ ngx_http_dummy_headers_parse(ngx_http_dummy_main_conf_t *main_cf,
       ngx_http_apply_rulematch_v_n(&nx_int__uncommon_hex_encoding, ctx, r, &h[i].key, &h[i].value, HEADERS, 1, 0);
     }
     if (cf->header_rules)
-      ngx_http_basestr_ruleset_n(r->pool, &lowcase_header, &(h[i].value), 
+      ngx_http_basestr_ruleset_n(r->pool, &lowcase_header, &(h[i].value),
 				 cf->header_rules, r, ctx, HEADERS);
     if (main_cf->header_rules)
-      ngx_http_basestr_ruleset_n(r->pool, &lowcase_header, &(h[i].value), 
+      ngx_http_basestr_ruleset_n(r->pool, &lowcase_header, &(h[i].value),
 				 main_cf->header_rules, r, ctx, HEADERS);
   }
   return ;
