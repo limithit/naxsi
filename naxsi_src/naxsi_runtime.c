@@ -1042,7 +1042,7 @@ ngx_http_output_forbidden_page(ngx_http_request_ctx_t *ctx,
   else {
     ngx_http_internal_redirect(r, cf->denied_url,  
 			       &empty); 
-    if (content_type_filter) { 
+    if (content_type_filter && !ctx->learning) { 
     ngx_http_finalize_request(r, NGX_HTTP_FORBIDDEN);  // struts2-045 046 defense
 	  /* MainRule "rx:%" "mz:$HEADERS_VAR:content-type" "s:DROP"; */
     }
